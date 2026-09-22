@@ -9,7 +9,7 @@ class LLM:
     @staticmethod
     def getresp():
         client = OpenAI(
-            api_key='sk-245b495fce5844e892edd0372171f9c3',
+            api_key='',
             base_url="https://api.deepseek.com")
 
         response = client.chat.completions.create(
