@@ -3,18 +3,19 @@ import time
 
 import requests
 
+from rag import hybrid_search, upsert_papers
+
 CROSSREF_API = "https://api.crossref.org/works"
-MAILTO = "foxylikesraccoon@gmail.com"   # TODO(你): 换成你的真实邮箱——Crossref礼貌池，进入优先通道
+MAILTO = "foxylikesraccoon@gmail.com"   # Crossref礼貌池，进入优先通道
 
 HEADERS = {"User-Agent": "AI-Agent paper-search-tool (github: FoxyBuddy)"}
 
-_seen_ids = set()        # 跨调用去重：见过的DOI不再返回
-MIN_INTERVAL = 1.5       # 礼貌性限流间隔（秒）
+MIN_INTERVAL = 1.5       # 礼貌性限流间隔（秒）——仅API路径需要，本地命中不睡
 _last_call = 0.0
 
 
 def _rate_limit_sleep():
-    """距上次调用不足间隔时睡满差额，避免触发服务端限流。"""
+    """距上次API调用不足间隔时睡满差额，避免触发服务端限流。"""
     global _last_call
     wait = MIN_INTERVAL - (time.time() - _last_call)
     if wait > 0:
@@ -34,8 +35,8 @@ def _clean_abstract(raw) -> str:
     return " ".join(re.sub(r"<[^>]+>", "", raw).split())
 
 
-def search_papers(query: str, max_results: int = 8) -> list[dict]:
-    """学术论文检索工具（Crossref后端）：限流休眠 + 按DOI去重 + 摘要截断。
+def _crossref_search(query: str, max_results: int) -> list[dict]:
+    """API检索层：限流休眠 + 单次请求内按DOI去重 + 摘要截断。
 
     设计决策D2：原arXiv后端在本网络路径上被WAF不稳定拦截（多词查询/id_list均406），
     换用Crossref——工具接口不变，上层Agent无感。
@@ -50,12 +51,12 @@ def search_papers(query: str, max_results: int = 8) -> list[dict]:
     resp = requests.get(CROSSREF_API, params=params, headers=HEADERS, timeout=30)
     resp.raise_for_status()
     items = resp.json().get("message", {}).get("items", [])
-    papers = []
+    papers, seen = [], set()
     for it in items:
         doi = it.get("DOI", "")
-        if doi in _seen_ids:                          # 去重：同一篇跨调用只出现一次
+        if doi in seen:                               # 单次请求内去重
             continue
-        _seen_ids.add(doi)
+        seen.add(doi)
         year = ((it.get("issued", {}).get("date-parts") or [[None]])[0] or [None])[0]
         papers.append({
             "paper_id": doi,
@@ -68,6 +69,26 @@ def search_papers(query: str, max_results: int = 8) -> list[dict]:
         if len(papers) >= max_results:
             break
     return papers
+
+
+def search_papers(query: str, max_results: int = 8) -> list[dict]:
+    """学术论文检索工具——本地RAG优先，Crossref API兜底（D8）。
+
+    本地向量库命中足量 -> 直接返回（快、无限流、跨会话缓存）；
+    不足 -> 调API并把新结果入库，供下次本地命中。
+    跨调用去重已退役：重复入库由Qdrant同id覆盖保证幂等（D1演化完成：去重→缓存）。
+    """
+    local, scores = hybrid_search(query, k=max_results)
+    if len(local) >= max_results:
+        for p, s in zip(local, scores):
+            p["_source"] = f"local({s})"
+        return local
+
+    fresh = _crossref_search(query, max_results)
+    upsert_papers(fresh)                               # 入库供下次命中
+    for p in fresh:
+        p["_source"] = "api"
+    return fresh
 
 
 def execute_tool(name: str, args: dict):
